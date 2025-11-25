@@ -364,13 +364,22 @@ def train_one_epoch(model, dataloader, criterion, optimizer, device, epoch):
         # Forward pass
         outputs = model(images)
 
-        # Resize density map if needed to match output size
+        # CRITICAL FIX: Handle size mismatch properly
         if outputs.shape != density_maps.shape:
-            density_maps = torch.nn.functional.interpolate(
+            # Calculate the scaling factor
+            scale_factor = (density_maps.shape[2] / outputs.shape[2]) * (density_maps.shape[3] / outputs.shape[3])
+            
+            # Downsample GT density map
+            density_maps_scaled = torch.nn.functional.interpolate(
                 density_maps, size=outputs.shape[2:], mode='bilinear', align_corners=False
             )
+            
+            # Scale the values to preserve the count
+            density_maps_scaled = density_maps_scaled * scale_factor
+        else:
+            density_maps_scaled = density_maps
 
-        loss = criterion(outputs, density_maps)
+        loss = criterion(outputs, density_maps_scaled)
 
         # Backward pass
         loss.backward()
@@ -394,12 +403,22 @@ def validate(model, dataloader, criterion, device):
 
             outputs = model(images)
 
+            # CRITICAL FIX: Handle size mismatch properly
             if outputs.shape != density_maps.shape:
-                density_maps = torch.nn.functional.interpolate(
+                # Calculate the scaling factor
+                scale_factor = (density_maps.shape[2] / outputs.shape[2]) * (density_maps.shape[3] / outputs.shape[3])
+                
+                # Downsample GT density map
+                density_maps_scaled = torch.nn.functional.interpolate(
                     density_maps, size=outputs.shape[2:], mode='bilinear', align_corners=False
                 )
+                
+                # Scale the values to preserve the count
+                density_maps_scaled = density_maps_scaled * scale_factor
+            else:
+                density_maps_scaled = density_maps
 
-            loss = criterion(outputs, density_maps)
+            loss = criterion(outputs, density_maps_scaled)
             running_loss += loss.item()
 
             # Calculate counting metrics
@@ -627,7 +646,7 @@ if __name__ == "__main__":
     CHECKPOINT_DIR = './CSRNETcheckpoints'
     BATCH_SIZE = 4
     CROP_SIZE = 512
-    NUM_EPOCHS = 20
+    NUM_EPOCHS = 30
     LEARNING_RATE = 1e-6
     WEIGHT_DECAY = 5e-4
     EDGE_METHOD = 'canny'  # or 'sobel'
@@ -642,8 +661,8 @@ if __name__ == "__main__":
         weight_decay=WEIGHT_DECAY,
         checkpoint_dir=CHECKPOINT_DIR,
         edge_method=EDGE_METHOD,
-        resume_from=None
-        #resume_from='./CSRNETcheckpoints/checkpoint_epoch_2.pth' #set to path to a checkpoint to resume from that checkpoint
+        #resume_from=None
+        resume_from='./CSRNETcheckpoints/checkpoint_epoch_20.pth' #set to path to a checkpoint to resume from that checkpoint
     )
 
     
