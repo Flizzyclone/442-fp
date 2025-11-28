@@ -14,6 +14,7 @@ from torchvision import transforms, models
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 
+
 class JHUCrowdDataset(Dataset):
     def __init__(self, data_root, split='train', use_edges=True,
                  edge_method='sobel', crop_size=512, downsample_ratio=8):
@@ -41,6 +42,12 @@ class JHUCrowdDataset(Dataset):
         self.img_files = sorted([f for f in os.listdir(self.img_dir)
                                  if f.endswith('.jpg')])
 
+        # ImageNet normalization for RGB channels (not edge channel)
+        self.normalize = transforms.Normalize(
+            mean=[0.485, 0.456, 0.406],
+            std=[0.229, 0.224, 0.225]
+        )
+
         print(f"Loaded {len(self.img_files)} images from {split} split")
 
     def __len__(self):
@@ -62,18 +69,23 @@ class JHUCrowdDataset(Dataset):
         if self.split == 'train' and self.crop_size:
             img_np, points = self.random_crop(img_np, points, self.crop_size)
 
-        # Generate density map
-        h, w = img_np.shape[:2]
-        density_map = self.generate_density_map((h, w), points)
-
-        # Extract edges if needed
+        # Extract edges FIRST (before generating density map)
+        edge_channel = None
         if self.use_edges:
             edge_channel = self.extract_edges(img_np)
-            # Concatenate as 4th channel
-            img_np = np.concatenate([img_np, edge_channel[..., None]], axis=2)
 
-        # Normalize image to [0, 1]
+        # Generate edge-aware density map
+        h, w = img_np.shape[:2]
+        density_map = self.generate_density_map((h, w), points, edge_map=edge_channel)
+
+        # Normalize RGB image to [0, 1] then apply ImageNet normalization
         img_tensor = torch.from_numpy(img_np).permute(2, 0, 1).float() / 255.0
+        img_tensor = self.normalize(img_tensor)  # Apply ImageNet normalization
+
+        # Add edge as 4th channel if using edges (normalize edge to [0, 1])
+        if self.use_edges:
+            edge_tensor = torch.from_numpy(edge_channel).float() / 255.0
+            img_tensor = torch.cat([img_tensor, edge_tensor.unsqueeze(0)], dim=0)
 
         # Convert density map to tensor
         density_tensor = torch.from_numpy(density_map).unsqueeze(0).float()
@@ -96,56 +108,71 @@ class JHUCrowdDataset(Dataset):
 
         return np.array(points)
 
-    def generate_density_map(self, shape, points, sigma=15):
-        """
-        Generate gaussian density map from point annotations
-        Uses adaptive sigma based on k-nearest neighbors for better results
-        """
-        h, w = shape
-        density = np.zeros((h, w), dtype=np.float32)
+    def generate_density_map(self, shape, points, sigma=15, edge_map=None):
+      """
+      Generate edge-aware gaussian density map from point annotations
+      
+      Args:
+          shape: (height, width) of density map
+          points: Nx2 array of (x, y) coordinates
+          sigma: Base sigma for Gaussian kernel
+          edge_map: Optional edge strength map to modulate kernel size
+      """
+      h, w = shape
+      density = np.zeros((h, w), dtype=np.float32)
 
-        if len(points) == 0:
-            return density
+      if len(points) == 0:
+          return density
 
-        for i, point in enumerate(points):
-            x, y = int(point[0]), int(point[1])
+      for i, point in enumerate(points):
+          x, y = int(point[0]), int(point[1])
 
-            # Check bounds
-            if x < 0 or x >= w or y < 0 or y >= h:
-                continue
+          if x < 0 or x >= w or y < 0 or y >= h:
+              continue
 
-            # Adaptive sigma (optional but recommended)
-            # Use fixed sigma for simplicity, or implement adaptive version
-            sigma_adaptive = sigma
+          # Adapt sigma based on edge strength if provided
+          sigma_adaptive = sigma
+          if edge_map is not None:
+              # Sample local edge strength (5x5 region around point)
+              x_start, x_end = max(0, x - 2), min(w, x + 3)
+              y_start, y_end = max(0, y - 2), min(h, y + 3)
+              local_edge_strength = edge_map[y_start:y_end, x_start:x_end].mean()
 
-            # Create gaussian kernel
-            size = int(6 * sigma_adaptive)
-            if size % 2 == 0:
-                size += 1
+              # Higher edge strength → smaller sigma (more precise localization)
+              # Edge strength is in [0, 255], normalize to [0, 1]
+              edge_factor = 1.0 - (local_edge_strength / 255.0) * 0.4  # Scale 0.6-1.0
+              sigma_adaptive = sigma * edge_factor
 
-            # Generate 2D gaussian
-            ax = np.arange(-size // 2 + 1., size // 2 + 1.)
-            xx, yy = np.meshgrid(ax, ax)
-            kernel = np.exp(-(xx**2 + yy**2) / (2. * sigma_adaptive**2))
+          # Create gaussian kernel
+          size = int(6 * sigma_adaptive)
+          if size % 2 == 0:
+              size += 1
 
-            # Normalize the kernel
-            kernel = kernel / kernel.sum()
+          # Generate 2D gaussian
+          ax = np.arange(-size // 2 + 1., size // 2 + 1.)
+          xx, yy = np.meshgrid(ax, ax)
+          kernel = np.exp(-(xx ** 2 + yy ** 2) / (2. * sigma_adaptive ** 2))
 
-            # Add to density map
-            x_start = max(0, x - size // 2)
-            x_end = min(w, x + size // 2 + 1)
-            y_start = max(0, y - size // 2)
-            y_end = min(h, y + size // 2 + 1)
+          # NORMALIZE THE KERNEL TO SUM TO 1.0
+          kernel = kernel / kernel.sum()
+          
+          # NO ADDITIONAL SCALING - keep it at 1.0 per person
 
-            kernel_x_start = size // 2 - (x - x_start)
-            kernel_x_end = kernel_x_start + (x_end - x_start)
-            kernel_y_start = size // 2 - (y - y_start)
-            kernel_y_end = kernel_y_start + (y_end - y_start)
+          # Add to density map
+          x_start = max(0, x - size // 2)
+          x_end = min(w, x + size // 2 + 1)
+          y_start = max(0, y - size // 2)
+          y_end = min(h, y + size // 2 + 1)
 
-            density[y_start:y_end, x_start:x_end] += \
-                kernel[kernel_y_start:kernel_y_end, kernel_x_start:kernel_x_end]
+          kernel_x_start = size // 2 - (x - x_start)
+          kernel_x_end = kernel_x_start + (x_end - x_start)
+          kernel_y_start = size // 2 - (y - y_start)
+          kernel_y_end = kernel_y_start + (y_end - y_start)
 
-        return density
+          density[y_start:y_end, x_start:x_end] += \
+              kernel[kernel_y_start:kernel_y_end, kernel_x_start:kernel_x_end]
+
+      return density
 
     def extract_edges(self, image):
         """Extract edge channel using Sobel or Canny"""
@@ -154,7 +181,7 @@ class JHUCrowdDataset(Dataset):
         if self.edge_method == 'sobel':
             sobel_x = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3)
             sobel_y = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3)
-            magnitude = np.sqrt(sobel_x**2 + sobel_y**2)
+            magnitude = np.sqrt(sobel_x ** 2 + sobel_y ** 2)
             # Normalize to 0-255
             magnitude = np.clip(magnitude, 0, 255).astype(np.uint8)
             return magnitude
@@ -182,7 +209,7 @@ class JHUCrowdDataset(Dataset):
         x = np.random.randint(0, w - crop_size + 1)
 
         # Crop image
-        img_cropped = img[y:y+crop_size, x:x+crop_size]
+        img_cropped = img[y:y + crop_size, x:x + crop_size]
 
         # Adjust points
         if len(points) > 0:
@@ -198,10 +225,11 @@ class JHUCrowdDataset(Dataset):
             points_cropped = points
 
         return img_cropped, points_cropped
-    
+
+
 # Create data loaders
 def create_data_loaders(data_root, batch_size=4, use_edges=True,
-                       edge_method='canny', crop_size=512):
+                        edge_method='canny', crop_size=512):
     """
     Create train, val, and test data loaders
     """
@@ -255,13 +283,14 @@ def create_data_loaders(data_root, batch_size=4, use_edges=True,
 
     return train_loader, val_loader, test_loader
 
+
 class CSRNet(nn.Module):
     def __init__(self, load_weights=False, input_channels=4):
         super(CSRNet, self).__init__()
         self.seen = 0
         self.input_channels = input_channels
         self.frontend_feat = [64, 64, 'M', 128, 128, 'M', 256, 256, 256, 'M', 512, 512, 512]
-        self.backend_feat  = [512, 512, 512, 256, 128, 64]
+        self.backend_feat = [512, 512, 512, 256, 128, 64]
 
         # Create frontend with custom input channels
         self.frontend = make_layers(self.frontend_feat, in_channels=input_channels)
@@ -321,12 +350,13 @@ class CSRNet(nn.Module):
                     # First conv layer - need to handle 4 channels
                     # Copy RGB weights
                     frontend_dict[key][:, :3, :, :] = vgg_dict[key]
-                    # Initialize 4th channel as mean of RGB channels
-                    frontend_dict[key][:, 3:, :, :] = vgg_dict[key].mean(dim=1, keepdim=True)
+                    # Initialize 4th channel with small random values
+                    nn.init.normal_(frontend_dict[key][:, 3:, :, :], mean=0, std=0.001)
                 else:
                     frontend_dict[key] = vgg_dict[key]
 
         self.frontend.load_state_dict(frontend_dict)
+
 
 def make_layers(cfg, in_channels=4, batch_norm=False, dilation=False):
     if dilation:
@@ -346,11 +376,101 @@ def make_layers(cfg, in_channels=4, batch_norm=False, dilation=False):
             in_channels = v
     return nn.Sequential(*layers)
 
+
+# ============================================================================
+# EDGE-AWARE LOSS FUNCTION
+# ============================================================================
+
+class EdgeAwareLoss(nn.Module):
+    def __init__(self, edge_weight=0.3):
+        """
+        Edge-aware loss that emphasizes errors near edges
+
+        Args:
+            edge_weight: Weight for edge regions (0.0 = no edge weighting)
+        """
+        super(EdgeAwareLoss, self).__init__()
+        self.edge_weight = edge_weight
+        self.mse = nn.MSELoss(reduction='none')
+
+    def forward(self, pred, target, edges=None):
+        """
+        Args:
+            pred: predicted density map [B, 1, H, W]
+            target: ground truth density map [B, 1, H, W]
+            edges: optional edge map [B, 1, H, W], normalized to [0, 1]
+        """
+        # Base MSE loss
+        mse_loss = self.mse(pred, target)
+
+        if edges is not None and self.edge_weight > 0:
+            # Resize edges to match prediction size if needed
+            if edges.shape != pred.shape:
+                edges = torch.nn.functional.interpolate(
+                    edges, size=pred.shape[2:], mode='bilinear', align_corners=False
+                )
+
+            # Edge-weighted loss: give more weight to errors near edges
+            edge_weights = 1.0 + self.edge_weight * edges
+            weighted_loss = (mse_loss * edge_weights).mean()
+        else:
+            weighted_loss = mse_loss.mean()
+
+        return weighted_loss
+
+class CombinedCountLoss(nn.Module):
+    def __init__(self, alpha=0.5, edge_weight=0.3):
+        """
+        Combined loss: MSE on density map + MAE on total count
+        
+        Args:
+            alpha: Weight for count loss vs density loss (0.5 = equal weight)
+            edge_weight: Weight for edge regions in density loss
+        """
+        super(CombinedCountLoss, self).__init__()
+        self.alpha = alpha
+        self.edge_weight = edge_weight
+        self.mse = nn.MSELoss(reduction='none')
+        self.mae = nn.L1Loss()
+    
+    def forward(self, pred, target, edges=None):
+        """
+        Args:
+            pred: predicted density map [B, 1, H, W]
+            target: ground truth density map [B, 1, H, W]
+            edges: optional edge map [B, 1, H, W], normalized to [0, 1]
+        """
+        # 1. Density map MSE loss
+        mse_loss = self.mse(pred, target)
+        
+        if edges is not None and self.edge_weight > 0:
+            # Resize edges to match prediction size if needed
+            if edges.shape != pred.shape:
+                edges = torch.nn.functional.interpolate(
+                    edges, size=pred.shape[2:], mode='bilinear', align_corners=False
+                )
+            
+            # Edge-weighted density loss
+            edge_weights = 1.0 + self.edge_weight * edges
+            density_loss = (mse_loss * edge_weights).mean()
+        else:
+            density_loss = mse_loss.mean()
+        
+        # 2. Count MAE loss (sum of all pixels)
+        pred_count = pred.sum(dim=(1, 2, 3))
+        target_count = target.sum(dim=(1, 2, 3))
+        count_loss = self.mae(pred_count, target_count)
+        
+        # 3. Combined loss
+        total_loss = (1 - self.alpha) * density_loss + self.alpha * count_loss
+        
+        return total_loss
+
 # ============================================================================
 # TRAINING UTILITIES
 # ============================================================================
 
-def train_one_epoch(model, dataloader, criterion, optimizer, device, epoch):
+def train_one_epoch(model, dataloader, criterion, optimizer, device, epoch, use_edge_loss=False):
     model.train()
     running_loss = 0.0
 
@@ -364,22 +484,19 @@ def train_one_epoch(model, dataloader, criterion, optimizer, device, epoch):
         # Forward pass
         outputs = model(images)
 
-        # CRITICAL FIX: Handle size mismatch properly
+        # Resize density map if needed to match output size
         if outputs.shape != density_maps.shape:
-            # Calculate the scaling factor
-            scale_factor = (density_maps.shape[2] / outputs.shape[2]) * (density_maps.shape[3] / outputs.shape[3])
-            
-            # Downsample GT density map
-            density_maps_scaled = torch.nn.functional.interpolate(
+            density_maps = torch.nn.functional.interpolate(
                 density_maps, size=outputs.shape[2:], mode='bilinear', align_corners=False
             )
-            
-            # Scale the values to preserve the count
-            density_maps_scaled = density_maps_scaled * scale_factor
-        else:
-            density_maps_scaled = density_maps
 
-        loss = criterion(outputs, density_maps_scaled)
+        # Compute loss
+        if use_edge_loss and images.shape[1] == 4:
+            # Extract edge channel (4th channel)
+            edges = images[:, 3:4, :, :]  # Shape: [B, 1, H, W]
+            loss = criterion(outputs, density_maps, edges)
+        else:
+            loss = criterion(outputs, density_maps)
 
         # Backward pass
         loss.backward()
@@ -390,7 +507,8 @@ def train_one_epoch(model, dataloader, criterion, optimizer, device, epoch):
 
     return running_loss / len(dataloader)
 
-def validate(model, dataloader, criterion, device):
+
+def validate(model, dataloader, criterion, device, use_edge_loss=False):
     model.eval()
     running_loss = 0.0
     mae = 0.0  # Mean Absolute Error
@@ -403,27 +521,23 @@ def validate(model, dataloader, criterion, device):
 
             outputs = model(images)
 
-            # CRITICAL FIX: Handle size mismatch properly
             if outputs.shape != density_maps.shape:
-                # Calculate the scaling factor
-                scale_factor = (density_maps.shape[2] / outputs.shape[2]) * (density_maps.shape[3] / outputs.shape[3])
-                
-                # Downsample GT density map
-                density_maps_scaled = torch.nn.functional.interpolate(
+                density_maps = torch.nn.functional.interpolate(
                     density_maps, size=outputs.shape[2:], mode='bilinear', align_corners=False
                 )
-                
-                # Scale the values to preserve the count
-                density_maps_scaled = density_maps_scaled * scale_factor
-            else:
-                density_maps_scaled = density_maps
 
-            loss = criterion(outputs, density_maps_scaled)
+            # Compute loss
+            if use_edge_loss and images.shape[1] == 4:
+                edges = images[:, 3:4, :, :]
+                loss = criterion(outputs, density_maps, edges)
+            else:
+                loss = criterion(outputs, density_maps)
+
             running_loss += loss.item()
 
             # Calculate counting metrics
-            pred_count = outputs.sum(dim=(1,2,3))
-            gt_count = density_maps.sum(dim=(1,2,3))
+            pred_count = outputs.sum(dim=(1, 2, 3))
+            gt_count = density_maps.sum(dim=(1, 2, 3))
             mae += torch.abs(pred_count - gt_count).sum().item()
             mse += ((pred_count - gt_count) ** 2).sum().item()
 
@@ -432,6 +546,7 @@ def validate(model, dataloader, criterion, device):
     avg_rmse = np.sqrt(mse / len(dataloader.dataset))
 
     return avg_loss, avg_mae, avg_rmse
+
 
 def save_checkpoint(model, optimizer, epoch, val_loss, path, train_loss, val_mae, val_rmse, history):
     checkpoint = {
@@ -451,6 +566,7 @@ def save_checkpoint(model, optimizer, epoch, val_loss, path, train_loss, val_mae
     torch.save(checkpoint, path)
     print(f"Checkpoint saved: {path}")
 
+
 def load_checkpoint(model, optimizer, path):
     checkpoint = torch.load(path, weights_only=False)
     model.load_state_dict(checkpoint['model_state_dict'])
@@ -460,6 +576,7 @@ def load_checkpoint(model, optimizer, path):
     history = checkpoint.get('history', None)
     print(f"Checkpoint loaded: epoch {epoch}, loss {loss:.4f}")
     return epoch, loss, history
+
 
 def plot_training_history(history, save_path='training_history.png'):
     """Plot training curves"""
@@ -503,23 +620,28 @@ def plot_training_history(history, save_path='training_history.png'):
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
     print(f"Training history saved to {save_path}")
 
+
 # ============================================================================
 # MAIN TRAINING FUNCTION
 # ============================================================================
 
+
 def train_csrnet(
-    data_root,
-    batch_size=4,
-    crop_size=512,
-    num_epochs=200,
-    learning_rate=1e-6,
-    weight_decay=5e-4,
-    checkpoint_dir='checkpoints',
-    resume_from=None,
-    edge_method='canny'
+        data_root,
+        batch_size=4,
+        crop_size=512,
+        num_epochs=400,
+        learning_rate=1e-6,
+        weight_decay=5e-4,
+        checkpoint_dir='checkpoints',
+        resume_from=None,
+        edge_method='canny',
+        use_edge_loss=True,
+        edge_loss_weight=0.3,
+        count_loss_alpha=0.5
 ):
     """
-    Main training function for CSRNet on JHU Crowd dataset
+    Main training function for CSRNet on JHU Crowd dataset with edge-aware features
 
     Args:
         data_root: Path to jhu_crowd_v2.0 directory
@@ -531,6 +653,9 @@ def train_csrnet(
         checkpoint_dir: Directory to save checkpoints
         resume_from: Path to checkpoint to resume from
         edge_method: 'canny' or 'sobel' for edge detection
+        use_edge_loss: Whether to use edge-aware loss
+        edge_loss_weight: Weight for edge regions in loss (0.0-1.0)
+        count_loss_alpha: Weight for count loss vs density loss (0.0-1.0)
     """
 
     # Create checkpoint directory
@@ -553,15 +678,23 @@ def train_csrnet(
     # Model, loss, optimizer
     print("Initializing model...")
     model = CSRNet(load_weights=False, input_channels=4).to(device)
-    criterion = nn.MSELoss()
-    optimizer = optim.Adam(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
 
-    history = None
+    # Use combined count + density loss
+    if use_edge_loss:
+        criterion = CombinedCountLoss(alpha=count_loss_alpha, edge_weight=edge_loss_weight)
+        print(f"Using CombinedCountLoss with alpha={count_loss_alpha}, edge_weight={edge_loss_weight}")
+    else:
+        criterion = nn.MSELoss()
+        print("Using standard MSELoss")
+
+    optimizer = optim.Adam(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
 
     # Learning rate scheduler
     scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=50, gamma=0.5)
 
     start_epoch = 0
+    history = None
+
     if resume_from and os.path.exists(resume_from):
         start_epoch, _, loaded_history = load_checkpoint(model, optimizer, resume_from)
         start_epoch += 1
@@ -579,24 +712,24 @@ def train_csrnet(
             'val_rmse': []
         }
 
-    print(history['train_loss'])
-
     best_mae = float('inf')
 
     # Training loop
     print(f"\nStarting training for {num_epochs} epochs...")
+    print(f"Edge method: {edge_method}, Edge-aware loss: {use_edge_loss}")
+    print(f"Count loss alpha: {count_loss_alpha}")
     print("=" * 70)
 
     for epoch in range(start_epoch, num_epochs):
-        print(f"\nEpoch {epoch+1}/{num_epochs}")
+        print(f"\nEpoch {epoch + 1}/{num_epochs}")
         print("-" * 70)
 
         # Train
-        train_loss = train_one_epoch(model, train_loader, criterion, optimizer, device, epoch+1)
+        train_loss = train_one_epoch(model, train_loader, criterion, optimizer, device, epoch + 1, use_edge_loss)
         history['train_loss'].append(train_loss)
 
         # Validate
-        val_loss, val_mae, val_rmse = validate(model, val_loader, criterion, device)
+        val_loss, val_mae, val_rmse = validate(model, val_loader, criterion, device, use_edge_loss)
         history['val_loss'].append(val_loss)
         history['val_mae'].append(val_mae)
         history['val_rmse'].append(val_rmse)
@@ -609,8 +742,8 @@ def train_csrnet(
         # Step scheduler
         scheduler.step()
 
-        # Save checkpoint
-        checkpoint_path = os.path.join(checkpoint_dir, f'checkpoint_epoch_{epoch+1}.pth')
+        # Save checkpoint every epoch
+        checkpoint_path = os.path.join(checkpoint_dir, f'checkpoint_epoch_{epoch + 1}.pth')
         save_checkpoint(model, optimizer, epoch, val_loss, checkpoint_path, train_loss, val_mae, val_rmse, history)
 
         # Save best model
@@ -635,7 +768,6 @@ def train_csrnet(
 
     return model, history
 
-
 # ============================================================================
 # FUNCTION CALL
 # ============================================================================
@@ -643,13 +775,16 @@ def train_csrnet(
 if __name__ == "__main__":
     # Configuration
     DATA_ROOT = './content/data/jhu_crowd_v2.0'
-    CHECKPOINT_DIR = './CSRNETcheckpoints'
+    CHECKPOINT_DIR = './CSRNETcheckpoints_edge_aware_v2'
     BATCH_SIZE = 4
     CROP_SIZE = 512
-    NUM_EPOCHS = 30
+    NUM_EPOCHS = 400  # Increased from 200
     LEARNING_RATE = 1e-6
     WEIGHT_DECAY = 5e-4
-    EDGE_METHOD = 'canny'  # or 'sobel'
+    EDGE_METHOD = 'canny'
+    USE_EDGE_LOSS = True
+    EDGE_LOSS_WEIGHT = 0.3
+    COUNT_LOSS_ALPHA = 0.5  # 50% count loss, 50% density loss
 
     # Train model
     model, history = train_csrnet(
@@ -661,8 +796,8 @@ if __name__ == "__main__":
         weight_decay=WEIGHT_DECAY,
         checkpoint_dir=CHECKPOINT_DIR,
         edge_method=EDGE_METHOD,
-        #resume_from=None
-        resume_from='./CSRNETcheckpoints/checkpoint_epoch_20.pth' #set to path to a checkpoint to resume from that checkpoint
+        use_edge_loss=USE_EDGE_LOSS,
+        edge_loss_weight=EDGE_LOSS_WEIGHT,
+        count_loss_alpha=COUNT_LOSS_ALPHA,
+        resume_from='./CSRNETcheckpoints_edge_aware_v2/checkpoint_epoch_106.pth'
     )
-
-    
